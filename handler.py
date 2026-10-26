@@ -11,42 +11,123 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import cv2
+import imageio
 import numpy as np
 import runpod
+import spandrel
 import torch
-from spandrel import ImageModelDescriptor, ModelLoader
+import torch.nn.functional as F
+
+try:
+    import spandrel_extra_arches
+
+    spandrel.MAIN_REGISTRY.add(*spandrel_extra_arches.EXTRA_REGISTRY)
+except Exception:
+    pass
 
 MODEL_DIR = Path("/models")
-TEMP_DIR = Path(tempfile.gettempdir()) / "rp_video_enhancer"
+TEMP_DIR = Path(tempfile.gettempdir()) / "rp_video_upscaler_stablepy"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-LOADED_MODELS: Dict[int, Any] = {}
+# Full 15-model catalog from louisnguyen198x/video-upscaler-stablepy
+UPSCALER_CATALOG: Dict[str, Tuple[str, str]] = {
+    "4x-UltraSharp": (
+        "4x-UltraSharp.pth",
+        "https://huggingface.co/Shandypur/ESRGAN-4x-UltraSharp/resolve/main/4x-UltraSharp.pth",
+    ),
+    "4x_foolhardy_Remacri": (
+        "4x_foolhardy_Remacri.pth",
+        "https://huggingface.co/FacehugmanIII/4x_foolhardy_Remacri/resolve/main/4x_foolhardy_Remacri.pth",
+    ),
+    "Real-ESRGAN-Anime-finetuning": (
+        "Real-ESRGAN-Anime-finetuning.pth",
+        "https://huggingface.co/danhtran2mind/Real-ESRGAN-Anime-finetuning/resolve/main/Real-ESRGAN-Anime-finetuning.pth",
+    ),
+    "AnimeSharp4x": (
+        "AnimeSharp4x.pth",
+        "https://huggingface.co/hollowstrawberry/upscalers-backup/resolve/main/ESRGAN/AnimeSharp%204x.pth",
+    ),
+    "RealisticRescaler4x": (
+        "RealisticRescaler4x.pth",
+        "https://huggingface.co/hollowstrawberry/upscalers-backup/resolve/main/ESRGAN/RealisticRescaler%204x.pth",
+    ),
+    "Remacri4xExtraSmoother": (
+        "Remacri4xExtraSmoother.pth",
+        "https://huggingface.co/hollowstrawberry/upscalers-backup/resolve/main/ESRGAN/Remacri%204x%20ExtraSmoother.pth",
+    ),
+    "lollypop": (
+        "lollypop.pth",
+        "https://huggingface.co/hollowstrawberry/upscalers-backup/resolve/main/ESRGAN/lollypop.pth",
+    ),
+    "NickelbackFS4x": (
+        "NickelbackFS4x.pth",
+        "https://huggingface.co/hollowstrawberry/upscalers-backup/resolve/main/ESRGAN/NickelbackFS%204x.pth",
+    ),
+    "RealESRNet_x4plus": (
+        "RealESRNet_x4plus.pth",
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.1/RealESRNet_x4plus.pth",
+    ),
+    "R-ESRGAN General WDN 4xV3": (
+        "R-ESRGAN_General_WDN_4xV3.pth",
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
+    ),
+    "R-ESRGAN AnimeVideo": (
+        "R-ESRGAN_AnimeVideo.pth",
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth",
+    ),
+    "R-ESRGAN 4x+": (
+        "R-ESRGAN_4x+.pth",
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+    ),
+    "R-ESRGAN 4x+ Anime6B": (
+        "R-ESRGAN_4x+_Anime6B.pth",
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+    ),
+    "ScuNET GAN": (
+        "ScuNET_GAN.pth",
+        "https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_gan.pth",
+    ),
+    "ScuNET PSNR": (
+        "ScuNET_PSNR.pth",
+        "https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth",
+    ),
+}
+
+LOADED_DESCRIPTORS: Dict[Tuple[str, bool], spandrel.ModelDescriptor] = {}
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def get_preloaded_model(scale: int):
-    """Load pre-baked RealESRGAN_x2.pth or RealESRGAN_x4.pth from /models into VRAM once."""
-    scale = 2 if scale == 2 else 4
-    if scale not in LOADED_MODELS:
-        filename = "RealESRGAN_x2.pth" if scale == 2 else "RealESRGAN_x4.pth"
-        model_path = MODEL_DIR / filename
-        if not model_path.exists():
-            from huggingface_hub import hf_hub_download
+def get_model_descriptor(upscaler_name: str, half_precision: bool = True) -> spandrel.ModelDescriptor:
+    if upscaler_name not in UPSCALER_CATALOG:
+        upscaler_name = "4x-UltraSharp"
 
-            model_path = Path(
-                hf_hub_download(repo_id="ai-forever/Real-ESRGAN", filename=filename)
-            )
-        descriptor = ModelLoader().load_from_file(str(model_path))
-        assert isinstance(descriptor, ImageModelDescriptor)
-        m = descriptor.model.to(DEVICE).eval()
-        if DEVICE.type == "cuda" and getattr(descriptor, "supports_half", True):
-            m = m.half()
-        LOADED_MODELS[scale] = m
-    return LOADED_MODELS[scale]
+    key = (upscaler_name, half_precision)
+    if key not in LOADED_DESCRIPTORS:
+        # Keep at most 2 models in VRAM cache simultaneously
+        if len(LOADED_DESCRIPTORS) >= 2:
+            LOADED_DESCRIPTORS.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        fname, url = UPSCALER_CATALOG[upscaler_name]
+        local_path = MODEL_DIR / fname
+        if not local_path.exists():
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(url, str(local_path))
+
+        desc = spandrel.ModelLoader(device=DEVICE).load_from_file(str(local_path))
+        desc.model.eval()
+        if DEVICE.type == "cuda" and half_precision and getattr(desc, "supports_half", True):
+            desc.model.half()
+        else:
+            desc.model.float()
+        LOADED_DESCRIPTORS[key] = desc
+
+    return LOADED_DESCRIPTORS[key]
 
 
 def check_nvenc() -> bool:
-    """Verify whether h264_nvenc hardware encoding is supported on this GPU worker."""
     try:
         p = subprocess.run(
             [
@@ -74,91 +155,79 @@ def check_nvenc() -> bool:
 NVENC_AVAILABLE = check_nvenc()
 
 
-def probe_video(video_path: str) -> Tuple[float, int, int, float, bool]:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "stream=index,codec_type,width,height,duration,r_frame_rate:format=duration",
-        "-of",
-        "json",
-        video_path,
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    width = height = 0
-    duration = 0.0
-    fps = 30.0
-    has_audio = False
-
-    if p.returncode == 0:
-        data = json.loads(p.stdout.decode("utf-8", errors="replace") or "{}")
-        for s in data.get("streams", []):
-            ctype = s.get("codec_type")
-            if ctype == "video" and width == 0:
-                width = int(s.get("width") or 0)
-                height = int(s.get("height") or 0)
-                if s.get("duration"):
-                    try:
-                        duration = float(s["duration"])
-                    except ValueError:
-                        pass
-                r_fps = s.get("r_frame_rate", "30/1")
-                try:
-                    if "/" in r_fps:
-                        num, den = r_fps.split("/")
-                        if float(den) > 0:
-                            fps = float(num) / float(den)
-                    else:
-                        fps = float(r_fps)
-                except ValueError:
-                    pass
-            elif ctype == "audio":
-                has_audio = True
-
-        if duration <= 0:
-            fmt_dur = data.get("format", {}).get("duration")
-            if fmt_dur:
-                try:
-                    duration = float(fmt_dur)
-                except ValueError:
-                    pass
-
-    if duration <= 0 or width == 0 or height == 0:
-        cap = cv2.VideoCapture(video_path)
-        if cap.isOpened():
-            if width == 0:
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cv_fps = cap.get(cv2.CAP_PROP_FPS)
-            if cv_fps and cv_fps > 0 and not np.isnan(cv_fps):
-                fps = float(cv_fps)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            if duration <= 0 and frame_count and frame_count > 0 and fps > 0:
-                duration = float(frame_count) / fps
-        cap.release()
-
-    return duration, width, height, fps, has_audio
+def has_audio_stream(video_path: str) -> bool:
+    try:
+        p = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "default=noprint_wrappers=1",
+                video_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        return bool(p.stdout.decode("utf-8", errors="replace").strip())
+    except Exception:
+        return False
 
 
-def decode_frames_to_memory(video_path: str, max_frames: int) -> List[np.ndarray]:
+def read_video_frames(video_path: str, max_seconds: float = 16.0) -> Tuple[List[np.ndarray], float, int, int]:
     cap = cv2.VideoCapture(video_path)
-    frames_rgb: List[np.ndarray] = []
-    while len(frames_rgb) < max_frames:
-        ret, bgr = cap.read()
-        if not ret or bgr is None:
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video file: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0 or np.isnan(fps):
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if width > 1920 or height > 1920:
+        cap.release()
+        raise ValueError(f"Video resolution too high ({width}x{height}). Maximum allowed is 1920x1920.")
+
+    max_allowed_frames = max(1, int(round(fps * max_seconds)))
+    raw_frames: List[np.ndarray] = []
+    while len(raw_frames) < max_allowed_frames:
+        ret, frame_bgr = cap.read()
+        if not ret or frame_bgr is None:
             break
-        frames_rgb.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        raw_frames.append(frame_bgr)
     cap.release()
-    return frames_rgb
+    return raw_frames, float(fps), width, height
 
 
-def enhance_frames_on_gpu(
-    frames_rgb: List[np.ndarray], scale: int, batch_size: int | None = None
+def upscale_frames_gpu(
+    raw_frames_bgr: List[np.ndarray],
+    upscaler_name: str = "4x-UltraSharp",
+    upscaler_factor: float = 2.0,
+    half_precision: bool = True,
+    batch_size: int | None = None,
 ) -> Tuple[List[np.ndarray], int]:
-    model = get_preloaded_model(scale)
-    total = len(frames_rgb)
-    h, w = frames_rgb[0].shape[:2]
+    desc = get_model_descriptor(upscaler_name, half_precision=half_precision)
+    model = desc.model
+    use_half = (
+        DEVICE.type == "cuda"
+        and half_precision
+        and getattr(desc, "supports_half", True)
+    )
+    native_scale = getattr(desc, "scale", 4) or 4
+
+    total = len(raw_frames_bgr)
+    h, w = raw_frames_bgr[0].shape[:2]
+    target_w = int(round(w * upscaler_factor))
+    target_h = int(round(h * upscaler_factor))
+    # Ensure even dimensions for H.264 yuv420p encoding
+    target_w -= target_w % 2
+    target_h -= target_h % 2
 
     if batch_size is None:
         if DEVICE.type == "cuda":
@@ -175,45 +244,71 @@ def enhance_frames_on_gpu(
         else:
             batch_size = 1
 
-    enhanced: List[np.ndarray] = []
+    enhanced_bgr: List[np.ndarray] = []
+    need_resize = abs(upscaler_factor - native_scale) > 0.05 or (
+        (h * native_scale) != target_h or (w * native_scale) != target_w
+    )
+
     with torch.inference_mode():
         for start_idx in range(0, total, batch_size):
-            batch_np = np.stack(frames_rgb[start_idx : start_idx + batch_size], axis=0)
-            tensor = torch.from_numpy(batch_np).to(device=DEVICE, non_blocking=True)
-            tensor = tensor.permute(0, 3, 1, 2).to(dtype=torch.float16).mul_(1.0 / 255.0)
-            output = model(tensor)
-            out_u8 = (
-                output.clamp_(0, 1)
+            batch_np = np.stack(raw_frames_bgr[start_idx : start_idx + batch_size], axis=0)
+            # Transfer compact uint8 BGR (B, H, W, 3) to GPU, flip BGR->RGB & normalize on GPU
+            t = torch.from_numpy(batch_np).to(device=DEVICE, non_blocking=True)
+            t = t.flip(-1).permute(0, 3, 1, 2).to(
+                dtype=torch.float16 if use_half else torch.float32
+            ).mul_(1.0 / 255.0)
+
+            out_t = model(t)
+
+            # Resize directly on GPU tensor before transferring back over PCIe
+            if need_resize:
+                out_t = F.interpolate(
+                    out_t,
+                    size=(target_h, target_w),
+                    mode="bicubic" if target_w > out_t.shape[-1] else "area",
+                    antialias=(target_w > out_t.shape[-1]),
+                )
+
+            # RGB -> BGR uint8 on GPU, then move to CPU numpy
+            out_u8_bgr = (
+                out_t.clamp_(0, 1)
                 .mul_(255.0)
                 .byte()
                 .permute(0, 2, 3, 1)
+                .flip(-1)
                 .cpu()
                 .numpy()
             )
-            for b in range(out_u8.shape[0]):
-                enhanced.append(out_u8[b])
+            for b in range(out_u8_bgr.shape[0]):
+                enhanced_bgr.append(out_u8_bgr[b])
 
     torch.cuda.synchronize()
-    return enhanced, batch_size
+    return enhanced_bgr, batch_size
 
 
-def encode_frames_from_memory(
-    frames_rgb: List[np.ndarray],
-    audio_src: str,
-    has_audio: bool,
-    out_path: str,
-    fps: float = 30.0,
+def write_output_video(
+    frames_bgr: List[np.ndarray],
+    src_video_path: str,
+    output_path: str,
+    fps: float,
+    speed_factor: float = 1.0,
+    as_gif: bool = False,
 ) -> str:
-    out_h, out_w = frames_rgb[0].shape[:2]
-    pad_w = out_w - (out_w % 2)
-    pad_h = out_h - (out_h % 2)
+    new_fps = fps * speed_factor if speed_factor > 0 else fps
+    if as_gif:
+        frames_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_bgr]
+        imageio.mimsave(output_path, frames_rgb, duration=(1.0 / new_fps))
+        return "imageio_gif"
 
+    out_h, out_w = frames_bgr[0].shape[:2]
     encoder_used = "h264_nvenc" if NVENC_AVAILABLE else "libx264"
     vcodec_args = (
         ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19", "-pix_fmt", "yuv420p"]
         if NVENC_AVAILABLE
         else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
     )
+
+    keep_audio = abs(speed_factor - 1.0) < 0.05 and has_audio_stream(src_video_path)
 
     cmd = [
         "ffmpeg",
@@ -223,20 +318,19 @@ def encode_frames_from_memory(
         "-vcodec",
         "rawvideo",
         "-pix_fmt",
-        "rgb24",
+        "bgr24",
         "-s",
         f"{out_w}x{out_h}",
         "-r",
-        f"{fps:.4f}",
+        f"{new_fps:.4f}",
         "-i",
         "pipe:0",
     ]
-    if has_audio:
-        cmd.extend(["-i", audio_src])
-    if pad_w != out_w or pad_h != out_h:
-        cmd.extend(["-vf", f"crop={pad_w}:{pad_h}:0:0"])
+    if keep_audio:
+        cmd.extend(["-i", src_video_path])
+
     cmd.extend(vcodec_args)
-    if has_audio:
+    if keep_audio:
         cmd.extend(
             [
                 "-c:a",
@@ -250,12 +344,12 @@ def encode_frames_from_memory(
                 "-shortest",
             ]
         )
-    cmd.extend(["-movflags", "+faststart", out_path])
+    cmd.extend(["-movflags", "+faststart", output_path])
 
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         assert proc.stdin is not None
-        for frame in frames_rgb:
+        for frame in frames_bgr:
             proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
         proc.stdin.close()
     except BrokenPipeError:
@@ -271,7 +365,12 @@ def encode_frames_from_memory(
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     t_total_start = time.perf_counter()
     inp = job.get("input", {})
-    scale = int(inp.get("scale", 4))
+
+    upscaler_name = str(inp.get("upscaler_name", "4x-UltraSharp"))
+    upscaler_factor = float(inp.get("upscaler_factor", 2.0))
+    as_gif = bool(inp.get("as_gif", False))
+    speed_factor = float(inp.get("speed_factor", 1.0))
+    half_precision = bool(inp.get("half_precision", True))
     max_seconds = float(inp.get("max_seconds", 16.0))
     batch_size_override = inp.get("batch_size")
     return_video_base64 = bool(inp.get("return_video_base64", True))
@@ -285,8 +384,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     job_dir = TEMP_DIR / f"job_{int(time.time() * 1000)}"
     job_dir.mkdir(parents=True, exist_ok=True)
+    ext = "gif" if as_gif else "mp4"
     in_video = job_dir / "input.mp4"
-    out_video = job_dir / "output_enhanced.mp4"
+    out_video = job_dir / f"upscaled.{ext}"
 
     try:
         if "video_base64" in inp and inp["video_base64"]:
@@ -298,33 +398,37 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raise ValueError("Provide either 'video_base64' or 'video_url' in input.")
 
-        duration, w, h, fps, has_audio = probe_video(str(in_video))
-        max_frames = max(1, int(round(fps * max_seconds)))
-
         t_dec0 = time.perf_counter()
-        frames_rgb = decode_frames_to_memory(str(in_video), max_frames)
+        raw_frames, fps, w, h = read_video_frames(str(in_video), max_seconds=max_seconds)
         decode_sec = time.perf_counter() - t_dec0
-        if not frames_rgb:
+        if not raw_frames:
             raise RuntimeError("No frames decoded from input video.")
 
-        num_frames = len(frames_rgb)
+        num_frames = len(raw_frames)
         torch.cuda.reset_peak_memory_stats()
         t_gpu0 = time.perf_counter()
-        enhanced_frames, used_batch_size = enhance_frames_on_gpu(
-            frames_rgb,
-            scale=scale,
+        enhanced_frames, used_batch_size = upscale_frames_gpu(
+            raw_frames,
+            upscaler_name=upscaler_name,
+            upscaler_factor=upscaler_factor,
+            half_precision=half_precision,
             batch_size=int(batch_size_override) if batch_size_override else None,
         )
         gpu_sec = time.perf_counter() - t_gpu0
         peak_vram_gb = round(torch.cuda.max_memory_allocated() / (1024**3), 2)
 
         out_h, out_w = enhanced_frames[0].shape[:2]
-        del frames_rgb
+        del raw_frames
         gc.collect()
 
         t_enc0 = time.perf_counter()
-        encoder_used = encode_frames_from_memory(
-            enhanced_frames, str(in_video), has_audio, str(out_video), fps
+        encoder_used = write_output_video(
+            enhanced_frames,
+            str(in_video),
+            str(out_video),
+            fps=fps,
+            speed_factor=speed_factor,
+            as_gif=as_gif,
         )
         encode_sec = time.perf_counter() - t_enc0
 
@@ -337,9 +441,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "gpu_name": gpu_name,
             "vram_gb": vram_gb,
             "peak_vram_gb": peak_vram_gb,
+            "upscaler_name": upscaler_name,
+            "upscaler_factor": upscaler_factor,
+            "available_models": list(UPSCALER_CATALOG.keys()),
             "input_resolution": f"{w}x{h}",
             "output_resolution": f"{out_w}x{out_h}",
-            "scale": scale,
             "fps_source": round(fps, 2),
             "frames_processed": num_frames,
             "batch_size": used_batch_size,
@@ -349,6 +455,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "gpu_fps": round(num_frames / gpu_sec, 2),
             "encode_sec": round(encode_sec, 3),
             "total_sec": round(total_sec, 3),
+            "output_format": ext,
             "output_size_mb": round(out_video.stat().st_size / (1024**2), 2),
         }
         if return_video_base64:
@@ -359,12 +466,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Warmup and pre-load both 2x and 4x models into VRAM before claiming jobs
     try:
         if torch.cuda.is_available():
-            get_preloaded_model(2)
-            get_preloaded_model(4)
-            print("Pre-loaded RealESRGAN 2x & 4x models into VRAM successfully.", flush=True)
+            # Pre-load default 4x-UltraSharp into VRAM before taking first job
+            get_model_descriptor("4x-UltraSharp", half_precision=True)
+            print("Pre-loaded default 4x-UltraSharp into VRAM.", flush=True)
     except Exception as e:
         print(f"Preload warning: {e}", flush=True)
 
