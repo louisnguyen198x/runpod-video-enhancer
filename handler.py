@@ -8,7 +8,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import imageio
@@ -25,6 +25,12 @@ try:
 except Exception:
     pass
 
+# Enable cuDNN autotuner & TF32 for maximum Tensor Core throughput on identical video frame shapes
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 MODEL_DIR = Path("/models")
 SHM_BASE = Path("/dev/shm") if Path("/dev/shm").exists() else Path(tempfile.gettempdir())
 TEMP_DIR = SHM_BASE / "rp_video_upscaler_stablepy"
@@ -32,6 +38,9 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 FFMPEG_BIN = "/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "ffmpeg"
 FFPROBE_BIN = "/usr/bin/ffprobe" if os.path.exists("/usr/bin/ffprobe") else "ffprobe"
+
+# Maximum safe raw file size (in bytes) to encode as Base64 inside Runpod's 20 MB JSON response limit
+MAX_SAFE_BASE64_RAW_BYTES = int(13.8 * 1024 * 1024)
 
 UPSCALER_CATALOG: Dict[str, Tuple[str, str]] = {
     "4x-UltraSharp": (
@@ -214,7 +223,7 @@ def upscale_frames_gpu(
     upscaler_name: str = "4x-UltraSharp",
     upscaler_factor: float = 2.0,
     half_precision: bool = True,
-    batch_size: int | None = None,
+    batch_size: Optional[int] = None,
 ) -> Tuple[List[np.ndarray], int]:
     desc = get_model_descriptor(upscaler_name, half_precision=half_precision)
     model = desc.model
@@ -232,16 +241,15 @@ def upscale_frames_gpu(
     target_w -= target_w % 2
     target_h -= target_h % 2
 
+    # Keep RRDBNet feature maps inside L2 SRAM cache (avoid DRAM thrashing on 24GB GPUs)
     if batch_size is None:
         if DEVICE.type == "cuda":
             vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             pixels = w * h
             if vram_gb >= 80:
-                batch_size = 8 if pixels <= 1920 * 1080 else 4
+                batch_size = 4 if pixels <= 960 * 540 else 2
             elif vram_gb >= 30:
-                batch_size = 4 if pixels <= 1920 * 1080 else 2
-            elif vram_gb >= 20:
-                batch_size = 4 if pixels <= 960 * 540 else (2 if pixels <= 1920 * 1080 else 1)
+                batch_size = 2 if pixels <= 960 * 540 else 1
             else:
                 batch_size = 1
         else:
@@ -251,14 +259,24 @@ def upscale_frames_gpu(
     need_resize = abs(upscaler_factor - native_scale) > 0.05 or (
         (h * native_scale) != target_h or (w * native_scale) != target_w
     )
+    target_dtype = torch.float16 if use_half else torch.float32
 
     with torch.inference_mode():
         for start_idx in range(0, total, batch_size):
-            batch_np = np.stack(raw_frames_bgr[start_idx : start_idx + batch_size], axis=0)
+            if batch_size == 1:
+                batch_np = raw_frames_bgr[start_idx][None, ...]
+            else:
+                batch_np = np.stack(raw_frames_bgr[start_idx : start_idx + batch_size], axis=0)
+
             t = torch.from_numpy(batch_np).to(device=DEVICE, non_blocking=True)
-            t = t.flip(-1).permute(0, 3, 1, 2).to(
-                dtype=torch.float16 if use_half else torch.float32
-            ).mul_(1.0 / 255.0)
+            # CRITICAL: .contiguous() after flip+permute unlocks cuDNN FP16 Tensor Core kernels!
+            t = (
+                t.flip(-1)
+                .permute(0, 3, 1, 2)
+                .contiguous()
+                .to(dtype=target_dtype)
+                .mul_(1.0 / 255.0)
+            )
 
             out_t = model(t)
 
@@ -276,14 +294,65 @@ def upscale_frames_gpu(
                 .byte()
                 .permute(0, 2, 3, 1)
                 .flip(-1)
+                .contiguous()
                 .cpu()
                 .numpy()
             )
             for b in range(out_u8_bgr.shape[0]):
                 enhanced_bgr.append(out_u8_bgr[b])
 
-    torch.cuda.synchronize()
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
     return enhanced_bgr, batch_size
+
+
+def upload_large_file(file_path: Path) -> Optional[str]:
+    """
+    Uploads large output video (>13.8 MB) to a fast temporary file host so the client
+    can download unlimited 4K/8K files directly without hitting Runpod's 20 MB JSON limit.
+    """
+    # Try litterbox (catbox 24h temporary storage) or 0x0.st via curl
+    upload_Commands = [
+        [
+            "curl",
+            "-sS",
+            "--max-time",
+            "45",
+            "-F",
+            "reqtype=fileupload",
+            "-F",
+            "time=24h",
+            "-F",
+            f"fileToUpload=@{file_path}",
+            "https://litterbox.catbox.moe/resources/internals/api.php",
+        ],
+        [
+            "curl",
+            "-sS",
+            "--max-time",
+            "45",
+            "-F",
+            f"file=@{file_path}",
+            "https://tmpfiles.org/api/v1/upload",
+        ],
+    ]
+    for cmd in upload_Commands:
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=50)
+            if p.returncode == 0:
+                out = p.stdout.decode("utf-8", errors="replace").strip()
+                if out.startswith("https://litter.catbox.moe/"):
+                    return out
+                if "tmpfiles.org" in out:
+                    data = json.loads(out)
+                    url = data.get("data", {}).get("url", "")
+                    if url:
+                        return url.replace("http://tmpfiles.org/", "https://tmpfiles.org/dl/").replace(
+                            "https://tmpfiles.org/", "https://tmpfiles.org/dl/"
+                        )
+        except Exception:
+            continue
+    return None
 
 
 def write_output_video(
@@ -301,6 +370,7 @@ def write_output_video(
         return "imageio_gif"
 
     out_h, out_w = frames_bgr[0].shape[:2]
+    duration_sec = max(1.0, len(frames_bgr) / max(1.0, new_fps))
 
     # Step 1: Write intermediate stream into /dev/shm RAM disk (0 pipe deadlock, ~0.3s)
     shm_raw_mp4 = str(Path(output_path).parent / "shm_raw_video.mp4")
@@ -310,13 +380,47 @@ def write_output_video(
         vw.write(frame)
     vw.release()
 
-    # Step 2: Transcode to H.264 (NVENC or libx264) + mux original audio cleanly
+    # Step 2: Calculate safe max bitrate so 4K video stays ~10-13 MB (< 20 MB Base64 JSON limit)
+    # Target max ~12.5 MB total -> ~100 Mbits / duration_sec
+    safe_mbits = max(4.0, min(14.0, 95.0 / duration_sec))
+    maxrate_str = f"{safe_mbits:.1f}M"
+    bufsize_str = f"{safe_mbits * 2.0:.1f}M"
+    is_4k = (out_w * out_h) >= (2560 * 1440)
+    cq_val = "22" if is_4k else "19"
+    crf_val = "21" if is_4k else "18"
+
     keep_audio = abs(speed_factor - 1.0) < 0.05 and has_audio_stream(src_video_path)
     encoder_used = "h264_nvenc" if NVENC_AVAILABLE else "libx264"
     vcodec_args = (
-        ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19", "-pix_fmt", "yuv420p"]
+        [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p4",
+            "-cq",
+            cq_val,
+            "-maxrate",
+            maxrate_str,
+            "-bufsize",
+            bufsize_str,
+            "-pix_fmt",
+            "yuv420p",
+        ]
         if NVENC_AVAILABLE
-        else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
+        else [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            crf_val,
+            "-maxrate",
+            maxrate_str,
+            "-bufsize",
+            bufsize_str,
+            "-pix_fmt",
+            "yuv420p",
+        ]
     )
 
     cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", shm_raw_mp4]
@@ -341,13 +445,27 @@ def write_output_video(
 
     p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
     if p.returncode != 0:
-        # Fallback to libx264 if NVENC failed on specific resolution
         if encoder_used == "h264_nvenc":
             encoder_used = "libx264"
             cmd_fb = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", shm_raw_mp4]
             if keep_audio:
                 cmd_fb.extend(["-i", src_video_path])
-            cmd_fb.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"])
+            cmd_fb.extend(
+                [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    crf_val,
+                    "-maxrate",
+                    maxrate_str,
+                    "-bufsize",
+                    bufsize_str,
+                    "-pix_fmt",
+                    "yuv420p",
+                ]
+            )
             if keep_audio:
                 cmd_fb.extend(["-c:a", "aac", "-b:a", "192k", "-map", "0:v:0", "-map", "1:a:0?", "-shortest"])
             cmd_fb.extend(["-movflags", "+faststart", output_path])
@@ -438,6 +556,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         gc.collect()
         torch.cuda.empty_cache()
 
+        file_bytes = out_video.stat().st_size
         total_sec = time.perf_counter() - t_total_start
         res: Dict[str, Any] = {
             "gpu_name": gpu_name,
@@ -457,10 +576,16 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "encode_sec": round(encode_sec, 3),
             "total_sec": round(total_sec, 3),
             "output_format": ext,
-            "output_size_mb": round(out_video.stat().st_size / (1024**2), 2),
+            "output_size_mb": round(file_bytes / (1024**2), 2),
         }
+
         if return_video_base64:
-            res["video_base64"] = base64.b64encode(out_video.read_bytes()).decode("ascii")
+            if file_bytes <= MAX_SAFE_BASE64_RAW_BYTES:
+                res["video_base64"] = base64.b64encode(out_video.read_bytes()).decode("ascii")
+            else:
+                dl_url = upload_large_file(out_video)
+                if dl_url:
+                    res["video_download_url"] = dl_url
         return res
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
