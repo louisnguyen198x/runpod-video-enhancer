@@ -26,10 +26,13 @@ except Exception:
     pass
 
 MODEL_DIR = Path("/models")
-TEMP_DIR = Path(tempfile.gettempdir()) / "rp_video_upscaler_stablepy"
+SHM_BASE = Path("/dev/shm") if Path("/dev/shm").exists() else Path(tempfile.gettempdir())
+TEMP_DIR = SHM_BASE / "rp_video_upscaler_stablepy"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Full 15-model catalog from louisnguyen198x/video-upscaler-stablepy
+FFMPEG_BIN = "/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "ffmpeg"
+FFPROBE_BIN = "/usr/bin/ffprobe" if os.path.exists("/usr/bin/ffprobe") else "ffprobe"
+
 UPSCALER_CATALOG: Dict[str, Tuple[str, str]] = {
     "4x-UltraSharp": (
         "4x-UltraSharp.pth",
@@ -103,7 +106,6 @@ def get_model_descriptor(upscaler_name: str, half_precision: bool = True) -> spa
 
     key = (upscaler_name, half_precision)
     if key not in LOADED_DESCRIPTORS:
-        # Keep at most 2 models in VRAM cache simultaneously
         if len(LOADED_DESCRIPTORS) >= 2:
             LOADED_DESCRIPTORS.clear()
             gc.collect()
@@ -131,8 +133,10 @@ def check_nvenc() -> bool:
     try:
         p = subprocess.run(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-hide_banner",
+                "-loglevel",
+                "error",
                 "-f",
                 "lavfi",
                 "-i",
@@ -143,8 +147,8 @@ def check_nvenc() -> bool:
                 "null",
                 "-",
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=5,
         )
         return p.returncode == 0
@@ -159,7 +163,7 @@ def has_audio_stream(video_path: str) -> bool:
     try:
         p = subprocess.run(
             [
-                "ffprobe",
+                FFPROBE_BIN,
                 "-v",
                 "error",
                 "-select_streams",
@@ -171,7 +175,7 @@ def has_audio_stream(video_path: str) -> bool:
                 video_path,
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             timeout=10,
         )
         return bool(p.stdout.decode("utf-8", errors="replace").strip())
@@ -185,7 +189,7 @@ def read_video_frames(video_path: str, max_seconds: float = 16.0) -> Tuple[List[
         raise RuntimeError(f"Cannot open video file: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0 or np.isnan(fps):
+    if not fps or fps <= 0 or fps > 240 or np.isnan(fps):
         fps = 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -225,7 +229,6 @@ def upscale_frames_gpu(
     h, w = raw_frames_bgr[0].shape[:2]
     target_w = int(round(w * upscaler_factor))
     target_h = int(round(h * upscaler_factor))
-    # Ensure even dimensions for H.264 yuv420p encoding
     target_w -= target_w % 2
     target_h -= target_h % 2
 
@@ -238,7 +241,7 @@ def upscale_frames_gpu(
             elif vram_gb >= 30:
                 batch_size = 4 if pixels <= 1920 * 1080 else 2
             elif vram_gb >= 20:
-                batch_size = 2 if pixels <= 1920 * 1080 else 1
+                batch_size = 4 if pixels <= 960 * 540 else (2 if pixels <= 1920 * 1080 else 1)
             else:
                 batch_size = 1
         else:
@@ -252,7 +255,6 @@ def upscale_frames_gpu(
     with torch.inference_mode():
         for start_idx in range(0, total, batch_size):
             batch_np = np.stack(raw_frames_bgr[start_idx : start_idx + batch_size], axis=0)
-            # Transfer compact uint8 BGR (B, H, W, 3) to GPU, flip BGR->RGB & normalize on GPU
             t = torch.from_numpy(batch_np).to(device=DEVICE, non_blocking=True)
             t = t.flip(-1).permute(0, 3, 1, 2).to(
                 dtype=torch.float16 if use_half else torch.float32
@@ -260,7 +262,6 @@ def upscale_frames_gpu(
 
             out_t = model(t)
 
-            # Resize directly on GPU tensor before transferring back over PCIe
             if need_resize:
                 out_t = F.interpolate(
                     out_t,
@@ -269,7 +270,6 @@ def upscale_frames_gpu(
                     antialias=(target_w > out_t.shape[-1]),
                 )
 
-            # RGB -> BGR uint8 on GPU, then move to CPU numpy
             out_u8_bgr = (
                 out_t.clamp_(0, 1)
                 .mul_(255.0)
@@ -301,6 +301,17 @@ def write_output_video(
         return "imageio_gif"
 
     out_h, out_w = frames_bgr[0].shape[:2]
+
+    # Step 1: Write intermediate stream into /dev/shm RAM disk (0 pipe deadlock, ~0.3s)
+    shm_raw_mp4 = str(Path(output_path).parent / "shm_raw_video.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    vw = cv2.VideoWriter(shm_raw_mp4, fourcc, new_fps, (out_w, out_h))
+    for frame in frames_bgr:
+        vw.write(frame)
+    vw.release()
+
+    # Step 2: Transcode to H.264 (NVENC or libx264) + mux original audio cleanly
+    keep_audio = abs(speed_factor - 1.0) < 0.05 and has_audio_stream(src_video_path)
     encoder_used = "h264_nvenc" if NVENC_AVAILABLE else "libx264"
     vcodec_args = (
         ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19", "-pix_fmt", "yuv420p"]
@@ -308,27 +319,9 @@ def write_output_video(
         else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
     )
 
-    keep_audio = abs(speed_factor - 1.0) < 0.05 and has_audio_stream(src_video_path)
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "rawvideo",
-        "-vcodec",
-        "rawvideo",
-        "-pix_fmt",
-        "bgr24",
-        "-s",
-        f"{out_w}x{out_h}",
-        "-r",
-        f"{new_fps:.4f}",
-        "-i",
-        "pipe:0",
-    ]
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", shm_raw_mp4]
     if keep_audio:
         cmd.extend(["-i", src_video_path])
-
     cmd.extend(vcodec_args)
     if keep_audio:
         cmd.extend(
@@ -346,19 +339,28 @@ def write_output_video(
         )
     cmd.extend(["-movflags", "+faststart", output_path])
 
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        assert proc.stdin is not None
-        for frame in frames_bgr:
-            proc.stdin.write(memoryview(np.ascontiguousarray(frame)))
-        proc.stdin.close()
-    except BrokenPipeError:
-        pass
+    p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    if p.returncode != 0:
+        # Fallback to libx264 if NVENC failed on specific resolution
+        if encoder_used == "h264_nvenc":
+            encoder_used = "libx264"
+            cmd_fb = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", shm_raw_mp4]
+            if keep_audio:
+                cmd_fb.extend(["-i", src_video_path])
+            cmd_fb.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"])
+            if keep_audio:
+                cmd_fb.extend(["-c:a", "aac", "-b:a", "192k", "-map", "0:v:0", "-map", "1:a:0?", "-shortest"])
+            cmd_fb.extend(["-movflags", "+faststart", output_path])
+            p2 = subprocess.run(cmd_fb, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+            if p2.returncode != 0:
+                shutil.move(shm_raw_mp4, output_path)
+                encoder_used = "mp4v_direct"
+        else:
+            shutil.move(shm_raw_mp4, output_path)
+            encoder_used = "mp4v_direct"
 
-    stderr_bytes = proc.stderr.read() if proc.stderr else b""
-    ret = proc.wait()
-    if ret != 0:
-        raise RuntimeError(f"FFmpeg encode failed: {stderr_bytes.decode('utf-8', errors='replace')}")
+    if os.path.exists(shm_raw_mp4):
+        os.remove(shm_raw_mp4)
     return encoder_used
 
 
@@ -443,7 +445,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             "peak_vram_gb": peak_vram_gb,
             "upscaler_name": upscaler_name,
             "upscaler_factor": upscaler_factor,
-            "available_models": list(UPSCALER_CATALOG.keys()),
             "input_resolution": f"{w}x{h}",
             "output_resolution": f"{out_w}x{out_h}",
             "fps_source": round(fps, 2),
@@ -468,7 +469,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 if __name__ == "__main__":
     try:
         if torch.cuda.is_available():
-            # Pre-load default 4x-UltraSharp into VRAM before taking first job
             get_model_descriptor("4x-UltraSharp", half_precision=True)
             print("Pre-loaded default 4x-UltraSharp into VRAM.", flush=True)
     except Exception as e:
